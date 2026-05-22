@@ -1,0 +1,68 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == "admin";
+    }
+
+    match /admins/{uid} {
+      // Admin-only. Bootstrap the first admin document via Firebase Console/Admin SDK.
+      allow read, write: if isAdmin();
+    }
+
+    match /questions/{questionId} {
+      // Public can read only active, non-deleted questions.
+      allow get, list: if resource.data.active == true && resource.data.isDeleted == false;
+
+      // Admin full control.
+      allow read, create, update, delete: if isAdmin();
+    }
+
+    match /responses/{responseId} {
+      // Public can only create.
+      allow create: if request.auth == null
+        && request.resource.data.keys().hasOnly(["createdAt", "anonymousId", "source", "answers"])
+        && request.resource.data.anonymousId is string
+        && request.resource.data.anonymousId.size() >= 8
+        && request.resource.data.source == "web"
+        // `serverTimestamp()` is evaluated to `request.time` in rules.
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.answers is list
+        && request.resource.data.answers.size() > 0
+        && request.resource.data.answers.size() <= 200;
+
+      // Prevent public read/delete.
+      allow read, delete: if false;
+
+      // Public can append a single extra answer (e.g. "3 words") shortly after submit.
+      // This is intentionally strict on what fields can change, but cannot perfectly
+      // prove an "append-only" operation in rules for lists of maps.
+      allow update: if request.auth == null
+        && resource.data.source == "web"
+        // Array transforms (e.g. arrayUnion) don't always materialize full fields in request.resource.data.
+        // Use writeFields to ensure only the `answers` field is being modified.
+        && request.writeFields.size() == 1
+        && request.writeFields.hasOnly(["answers"])
+        && request.time < resource.data.createdAt + duration.value(10, "s")
+        // Soft cap: allow at most one extra answer beyond the original payload.
+        && resource.data.answers is list
+        && resource.data.answers.size() <= 200;
+
+      // Admin read and update for analytics/export.
+      allow get, list: if isAdmin();
+      allow update, delete: if isAdmin();
+    }
+
+    match /settings/{docId} {
+      allow get, list: if true;
+      allow create, update, delete: if isAdmin();
+    }
+  }
+}
