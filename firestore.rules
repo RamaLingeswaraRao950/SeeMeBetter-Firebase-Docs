@@ -6,63 +6,67 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function isAdmin() {
-      return isSignedIn()
-        && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-        && get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == "admin";
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
     }
 
-    match /admins/{uid} {
-      // Admin-only. Bootstrap the first admin document via Firebase Console/Admin SDK.
-      allow read, write: if isAdmin();
-    }
-
-    match /questions/{questionId} {
-      // Public can read only active, non-deleted questions.
-      allow get, list: if resource.data.active == true && resource.data.isDeleted == false;
-
-      // Admin full control.
-      allow read, create, update, delete: if isAdmin();
-    }
-
-    match /responses/{responseId} {
-      // Public can only create.
-      allow create: if request.auth == null
-        && request.resource.data.keys().hasOnly(["createdAt", "anonymousId", "source", "answers"])
-        && request.resource.data.anonymousId is string
-        && request.resource.data.anonymousId.size() >= 8
-        && request.resource.data.source == "web"
-        // `serverTimestamp()` is evaluated to `request.time` in rules.
-        && request.resource.data.createdAt == request.time
-        && request.resource.data.answers is list
-        && request.resource.data.answers.size() > 0
-        && request.resource.data.answers.size() <= 200;
-
-      // Prevent public read/delete.
-      allow read, delete: if false;
-
-      // Public can append a single extra answer (e.g. "3 words") shortly after submit.
-      // This is intentionally strict on what fields can change, but cannot perfectly
-      // prove an "append-only" operation in rules for lists of maps.
-      allow update: if request.auth == null
-        && resource.data.source == "web"
-        // Array transforms (e.g. arrayUnion) don't always materialize full fields in request.resource.data.
-        // Use writeFields to ensure only the `answers` field is being modified.
-        && request.writeFields.size() == 1
-        && request.writeFields.hasOnly(["answers"])
-        && request.time < resource.data.createdAt + duration.value(10, "s")
-        // Soft cap: allow at most one extra answer beyond the original payload.
-        && resource.data.answers is list
-        && resource.data.answers.size() <= 200;
-
-      // Admin read and update for analytics/export.
-      allow get, list: if isAdmin();
-      allow update, delete: if isAdmin();
-    }
-
-    match /settings/{docId} {
+    // Handle -> uid mapping for public links like /{handle}/feedback.
+    match /handles/{handle} {
       allow get, list: if true;
-      allow create, update, delete: if isAdmin();
+      allow create: if isSignedIn()
+        && !exists(/databases/$(database)/documents/handles/$(handle))
+        && request.resource.data.keys().hasOnly(["uid", "handle", "createdAt"])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.handle == handle;
+      allow update, delete: if false;
+    }
+
+    // Public user profile/settings (simple mode): readable by anyone.
+    // IMPORTANT: Only store public-safe fields in this document.
+    match /users/{uid} {
+      // "Simple mode": this document is publicly readable, but should only contain public-safe fields.
+      // Public pages only need `get` (they already know uid via `handles/{handle}`), so disallow `list`.
+      allow get: if true;
+      allow list: if false;
+      allow create, update, delete: if isOwner(uid);
+
+      match /questions/{questionId} {
+        // Owner can read/manage all their questions. Public can only read active, non-deleted questions.
+        allow get, list: if isOwner(uid) || (resource.data.active == true && resource.data.isDeleted == false);
+        allow create, update, delete: if isOwner(uid);
+      }
+
+      match /responses/{responseId} {
+        // Public can only create.
+        allow create: if request.auth == null
+          && request.resource.data.keys().hasOnly(["createdAt", "anonymousId", "source", "answers", "formHandle"])
+          && request.resource.data.anonymousId is string
+          && request.resource.data.anonymousId.size() >= 8
+          && request.resource.data.source == "web"
+          && request.resource.data.formHandle is string
+          && request.resource.data.formHandle.size() >= 3
+          // `serverTimestamp()` is evaluated to `request.time` in rules.
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.answers is list
+          && request.resource.data.answers.size() > 0
+          && request.resource.data.answers.size() <= 200;
+
+        // Prevent public read/delete.
+        allow read, delete: if false;
+
+        // Public can append "3 words" shortly after submit.
+        allow update: if request.auth == null
+          && resource.data.source == "web"
+          && request.writeFields.size() == 1
+          && request.writeFields.hasOnly(["answers"])
+          // Allow a reasonable window for users to reach /thank-you and submit optional "3 words".
+          && request.time < resource.data.createdAt + duration.value(24, "h")
+          && resource.data.answers is list
+          && resource.data.answers.size() <= 200;
+
+        // Owner can read/manage.
+        allow get, list, update, delete: if isOwner(uid);
+      }
     }
   }
 }
